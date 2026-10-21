@@ -212,11 +212,35 @@ bool PostinstallRunnerAction::MountPartition(
   if (!source_path.empty()) {
     brillo::Blob chunk;
 
-    utils::ReadFileChunk(source_path, 0x400 + 0x34, sizeof(uint16_t), &chunk);
-    mount_count = *reinterpret_cast<uint16_t*>(chunk.data());
+    // Read the mount count together with the magic signature, and only
+    // trust it on ext4. Other file systems such as EROFS are read-only and
+    // keep unrelated data at this offset.
+    if (utils::ReadFileChunk(source_path, 0x400 + 0x34, 6, &chunk) && chunk.size() == 6) {
+      uint16_t magic = chunk[4] | (chunk[5] << 8);
+      if (magic == 0xEF53) {
+        mount_count = chunk[0] | (chunk[1] << 8);
+      } else {
+        LOG(INFO) << source_path << " is not ext4, skipping backuptool scripts";
+      }
+    }
   }
 
   LOG(INFO) << source_path << " has been mounted R/W " << mount_count << " times.";
+
+  // Builds without addon.d support don't ship the backuptool scripts, so
+  // check for them on a read-only mount before making the target writable.
+  if (mount_count > 0) {
+    bool has_backuptool = false;
+    if (utils::MountFilesystem(mountable_device, fs_mount_dir_, MS_RDONLY,
+                               partition.filesystem_type, "seclabel")) {
+      has_backuptool = utils::FileExists("/postinstall/system/bin/backuptool_postinstall.sh");
+      utils::UnmountFilesystem(fs_mount_dir_);
+    }
+    if (!has_backuptool) {
+      LOG(INFO) << "Target " << partition.name << " has no backuptool scripts";
+      mount_count = 0;
+    }
+  }
 
   if (mount_count > 0) {
     if (!utils::SetBlockDeviceReadOnly(mountable_device, false)) {
